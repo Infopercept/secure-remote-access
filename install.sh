@@ -21,7 +21,7 @@ GUACD_CONF="${GUAC_HOME}/guacd.conf"
 RECORD_DIR="/var/lib/guacamole/recordings"
 
 TOMCAT_SVC="tomcat9"
-TOMCAT_SERVER_XML="/etc/tomcat9/server.xml"
+TOMCAT_SERVER_XML="/etc/tomcat9/server.xml"     # May be a symlink on Debian/Ubuntu
 TOMCAT_WEBAPPS="/var/lib/tomcat9/webapps"
 WAR_DEST="${TOMCAT_WEBAPPS}/guacamole.war"
 
@@ -39,13 +39,13 @@ touch "$LOG"; chmod 600 "$LOG"
 
 say() { printf '%s\n' "$*"; }                            # brief console line
 note() { printf '%s\n' "$*" >>"$LOG"; }                  # log only
-run() {                                                  # run <desc> <command...>
+run() {                                                  # run <desc> <command...> (fail-fast)
   local desc="$1"; shift
   say "• $desc"
   note ""
   note "== $desc =="
   # shellcheck disable=SC2068
-  bash -o pipefail -c "$*" >>"$LOG" 2>&1
+  bash -o errexit -o pipefail -c "$*" >>"$LOG" 2>&1
 }
 
 write_file() {  # write_file <path> <content>
@@ -73,7 +73,7 @@ export DEBIAN_FRONTEND=noninteractive
 say "== ZTNA install (logged to $LOG) =="
 
 run "Install prerequisites (nginx, tomcat9, acl, tools)" \
-  "apt-get update -y && apt-get install -y curl wget tar nginx openssl acl ${TOMCAT_SVC}"
+  "apt-get update -y && apt-get install -y curl wget tar nginx openssl acl xmlstarlet ${TOMCAT_SVC}"
 
 TMPDIR="$(mktemp -d)"; trap 'rm -rf "${TMPDIR}"; finish' EXIT
 
@@ -86,7 +86,7 @@ run "Fetch secure-remote installer" \
 run "Run installer (non-interactive)" \
   "'${TMPDIR}/secure-remote-install.sh' --mysqlpwd '${MYSQL_PWD}' --guacpwd '${GUAC_PWD}' --nomfa --installmysql"
 
-run "Ensure GUACAMOLE_HOME layout" \
+run "Ensure ZTNA_HOME layout" \
   "mkdir -p '${EXT_DIR}' '${LIB_DIR}'"
 
 # =========================
@@ -95,7 +95,7 @@ run "Ensure GUACAMOLE_HOME layout" \
 run "Download rebranded WAR" \
   "curl -fL '${WAR_URL}' -o '${TMPDIR}/guacamole.war'"
 
-run "Deploy WAR to ${WAR_DEST}" \
+run "Deploy WAR" \
   "install -m 0644 -o root -g tomcat '${TMPDIR}/guacamole.war' '${WAR_DEST}'"
 
 # =========================
@@ -154,36 +154,38 @@ run "Enable site and reload Nginx" \
   "ln -fs '${SITE_AVAIL}' '${SITE_ENABLED}'; nginx -t; systemctl reload nginx"
 
 # =========================
-# 4) Tomcat: 127.0.0.1 bind + RemoteIpValve
+# 4) Tomcat: 127.0.0.1 bind + RemoteIpValve (symlink-safe)
 # =========================
 if [ -f "${TOMCAT_SERVER_XML}" ]; then
+  # Resolve real path to avoid in-place edits replacing a symlink
+  TOMCAT_SERVER_XML_REAL="$(readlink -f "${TOMCAT_SERVER_XML}" || echo "${TOMCAT_SERVER_XML}")"
+
   run "Backup Tomcat server.xml" \
-    "cp -a '${TOMCAT_SERVER_XML}' '${TOMCAT_SERVER_XML}.bak_$(date +%F_%T)'"
+    "cp -a '${TOMCAT_SERVER_XML_REAL}' '${TOMCAT_SERVER_XML_REAL}.bak_$(date +%F_%T)'"
 
   run "Bind Tomcat 8080 to 127.0.0.1" \
-    "grep -q '<Connector port=\"8080\" protocol=\"HTTP/1.1\"' '${TOMCAT_SERVER_XML}' && \
-     ! grep -q 'Connector.*port=\"8080\".*address=\"127.0.0.1\"' '${TOMCAT_SERVER_XML}' && \
-     sed -i '/<Connector port=\"8080\" protocol=\"HTTP\\/1\\.1\"/ s#<Connector #<Connector address=\"127.0.0.1\" #' '${TOMCAT_SERVER_XML}' || true"
+    "xmlstarlet ed --inplace \
+       -u '//Connector[@port=\"8080\"]/@address' -v '127.0.0.1' \
+       '${TOMCAT_SERVER_XML_REAL}' || \
+     xmlstarlet ed --inplace \
+       -i '//Connector[@port=\"8080\"]' -t attr -n address -v '127.0.0.1' \
+       '${TOMCAT_SERVER_XML_REAL}'"
 
-  if ! grep -q 'org.apache.catalina.valves.RemoteIpValve' "${TOMCAT_SERVER_XML}"; then
-    VALVE_SNIPPET=$(cat <<'EOF'
-        <!-- Honor X-Forwarded-* from Nginx -->
-        <Valve className="org.apache.catalina.valves.RemoteIpValve"
-               internalProxies="127\.0\.0\.1|0:0:0:0:0:0:0:1"
-               remoteIpHeader="x-forwarded-for"
-               proxiesHeader="x-forwarded-by"
-               protocolHeader="x-forwarded-proto" />
-EOF
-)
-    run "Insert RemoteIpValve" \
-      "awk -v needle='<Host ' -v snippet='${VALVE_SNIPPET//\'/\\\'}' \
-        '{ print; if (\$0 ~ needle && !ins) { ins=1; print snippet } }' \
-        '${TOMCAT_SERVER_XML}' > '${TOMCAT_SERVER_XML}.new'; \
-       mv '${TOMCAT_SERVER_XML}.new' '${TOMCAT_SERVER_XML}'"
-  else
-    run "Normalize RemoteIpValve attribute" \
-      "sed -i -E 's/remoteIpProxiesHeader=\"/proxiesHeader=\"/g' '${TOMCAT_SERVER_XML}'"
-  fi
+  run "Insert RemoteIpValve if missing" \
+    "grep -q 'org.apache.catalina.valves.RemoteIpValve' '${TOMCAT_SERVER_XML_REAL}' || \
+     xmlstarlet ed --inplace \
+       -s '//Host' -t elem -n Valve -v '' \
+       -i '//Host/Valve[not(@className)]' -t attr -n className -v 'org.apache.catalina.valves.RemoteIpValve' \
+       -i '//Host/Valve[@className=\"org.apache.catalina.valves.RemoteIpValve\"]' -t attr -n internalProxies -v '127.0.0.1|0:0:0:0:0:0:0:1' \
+       -i '//Host/Valve[@className=\"org.apache.catalina.valves.RemoteIpValve\"]' -t attr -n remoteIpHeader -v 'x-forwarded-for' \
+       -i '//Host/Valve[@className=\"org.apache.catalina.valves.RemoteIpValve\"]' -t attr -n proxiesHeader -v 'x-forwarded-by' \
+       -i '//Host/Valve[@className=\"org.apache.catalina.valves.RemoteIpValve\"]' -t attr -n protocolHeader -v 'x-forwarded-proto' \
+       '${TOMCAT_SERVER_XML_REAL}'"
+
+  # Keep permissions sane (avoid surprises if real path differs)
+  run "Ensure Tomcat conf ownership (best-effort)" \
+    "chown -R daemon:tomcat /var/lib/tomcat9/conf || true; \
+     chown daemon:tomcat '${TOMCAT_SERVER_XML_REAL}' 2>/dev/null || true"
 fi
 
 # =========================
@@ -204,14 +206,15 @@ run "Set recording-search-path property" \
    fi"
 
 # =========================
-# 6) Make  world-readable (dirs 755, files 644)
+# 6) Make world-readable (dirs 755, files 644)
 # =========================
-run "Apply read-perms for GUACAMOLE_HOME" \
+run "Apply read-perms for ZTNA_HOME" \
   "chmod 755 '${GUAC_HOME}' '${EXT_DIR}' '${LIB_DIR}'; \
    chmod 644 '${GUAC_PROPERTIES}' '${GUACD_CONF}' 2>/dev/null || true; \
    chmod 644 '${EXT_DIR}'/*.jar 2>/dev/null || true; \
    chmod 644 '${LIB_DIR}'/*.jar 2>/dev/null || true; \
-   chown -R root:root '${GUAC_HOME}' || true"
+   chown -R root:root '${GUAC_HOME}' || true; \
+   chown -R daemon:tomcat /var/lib/tomcat9/conf || true"
 
 # =========================
 # 7) Recording path perms (guacd writer + tomcat reader)
@@ -220,7 +223,7 @@ GUACD_USER="$(systemctl show -p User guacd.service | cut -d= -f2 || true)"
 [ -z "$GUACD_USER" ] && GUACD_USER="guacd"
 say "• guacd user: $GUACD_USER"
 
-run "Prepare parent dir /var/lib/guacamole (traversable)" \
+run "Prepare parent dir (traversable)" \
   "mkdir -p /var/lib/guacamole '${RECORD_DIR}'; \
    chown '${GUACD_USER}:tomcat' /var/lib/guacamole; \
    chmod 2755 /var/lib/guacamole"
@@ -254,6 +257,5 @@ run "Reload Nginx" \
 
 say "======================================================="
 say " ZTNA ready at: https://<server-ip>/"
-say " Recordings dir: ${RECORD_DIR} (owner ${GUACD_USER}:tomcat)"
 say " Log file: ${LOG}"
 say "======================================================="
