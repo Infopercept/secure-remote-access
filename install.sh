@@ -206,6 +206,17 @@ run "Set recording-search-path property" \
    fi"
 
 # =========================
+# 5b) OIDC SSO extension
+# =========================
+run "Download OIDC SSO extension ${GUAC_VER}" \
+  "curl -fsSL 'https://downloads.apache.org/guacamole/${GUAC_VER}/binary/guacamole-auth-sso-${GUAC_VER}.tar.gz' -o '${TMPDIR}/oidc.tar.gz' && \
+   tar -xzf '${TMPDIR}/oidc.tar.gz' -C '${TMPDIR}'"
+
+run "Install OIDC extension JAR" \
+  "cp -f '${TMPDIR}/guacamole-auth-sso-${GUAC_VER}/openid/guacamole-auth-sso-openid-${GUAC_VER}.jar' '${EXT_DIR}/'"
+
+
+# =========================
 # 6) Make world-readable (dirs 755, files 644)
 # =========================
 run "Apply read-perms for ZTNA_HOME" \
@@ -245,6 +256,23 @@ run "Set guacd UMask=007 (systemd drop-in) & reload" \
 
 run "Set default ACLs so children inherit rwx for guacd:tomcat" \
   "setfacl -Rm d:u:'${GUACD_USER}':rwx,d:g:tomcat:rwx,u:'${GUACD_USER}':rwx,g:tomcat:rwx '${RECORD_DIR}'"
+
+run "Configure OIDC " \
+  "if grep -q 'openid-issuer' '${GUAC_PROPERTIES}'; then
+     note 'OIDC configuration already present — skipping add.'
+   else
+     printf '\\n## OIDC Configuration\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-issuer: http://172.17.14.3:8080/realms/any\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-authorization-endpoint: http://172.17.14.38:8080/realms/any/protocol/openid-connect/auth\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-jwks-endpoint: http://172.17.14.38:8080/realms/any/protocol/openid-connect/certs\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-redirect-uri: https://172.17.14.39/\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-client-id: ot-secure-access\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-client-secret: dgC8B6ByGkTmhOD2izzU8WvFpONhRo4j\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-username-claim-type: preferred_username\\n' >> '${GUAC_PROPERTIES}'
+     printf 'openid-allow-unverified-users: true\\n' >> '${GUAC_PROPERTIES}'
+     printf 'extension-priority: *, openid\\n' >> '${GUAC_PROPERTIES}'
+   fi"
+
 
 # =========================
 # 8) Restart services
