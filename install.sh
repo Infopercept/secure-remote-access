@@ -273,15 +273,52 @@ run "Configure OIDC " \
      printf 'extension-priority: *, openid\\n' >> '${GUAC_PROPERTIES}'
    fi"
 
+# =========================
+# 7b) Replace vendor service with ot-secure.service
+# =========================
+OT_UNIT_PATH="/etc/systemd/system/ot-secure.service"
+OT_UNIT_CONTENT=$(cat <<'EOF'
+
+[Unit]
+Description=Ztna Server
+Documentation=man:guacd(8)
+After=network.target
+
+[Service]
+User=daemon
+# Keep recordings private to daemon:tomcat and inherited children
+UMask=007
+ExecStart=/usr/local/sbin/guacd -f
+Restart=on-abnormal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+
+write_file "${OT_UNIT_PATH}" "${OT_UNIT_CONTENT}"
+
+run "Reload systemd units" \
+  "systemctl daemon-reload"
+
+# Stop/disable distro-provided unit if it exists
+run "Stop & disable guacd.service (best-effort)" \
+  "systemctl stop guacd.service 2>/dev/null || true; systemctl disable guacd.service 2>/dev/null || true"
+
+# Enable/start our custom unit
+run "Enable and start ot-secure.service" \
+  "systemctl enable ot-secure.service && systemctl start ot-secure.service"
+
 
 # =========================
 # 8) Restart services
 # =========================
-run "Restart guacd and Tomcat" \
-  "systemctl restart guacd '${TOMCAT_SVC}'"
+run "Restart ot-secure (guacd) and Tomcat" \
+  "systemctl restart ot-secure '${TOMCAT_SVC}'"
 
 run "Reload Nginx" \
   "nginx -t && systemctl reload nginx"
+
 
 say "======================================================="
 say " ZTNA ready at: https://<server-ip>/"
