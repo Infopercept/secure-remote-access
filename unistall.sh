@@ -18,6 +18,14 @@ for svc in guacd tomcat9 tomcat10 nginx mysql mariadb; do
   systemctl disable "${svc}.service" 2>/dev/null || true
 done
 
+echo "[*] Remove custom ot-secure.service (if present)..."
+systemctl stop ot-secure.service 2>/dev/null || true
+systemctl disable ot-secure.service 2>/dev/null || true
+quiet_rm /etc/systemd/system/ot-secure.service \
+         /etc/systemd/system/ot-secure.service.d
+systemctl daemon-reload || true
+systemctl reset-failed 2>/dev/null || true
+
 echo "[*] Remove Nginx sites/config..."
 quiet_rm /etc/nginx/sites-enabled/guacamole.conf \
          /etc/nginx/sites-enabled/ztna.conf \
